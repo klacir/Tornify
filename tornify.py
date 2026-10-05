@@ -6,6 +6,14 @@ import asyncio
 import sys, os
 from collections import defaultdict
 
+# Compatibilidade com Flet 1.x, que removeu helpers de alinhamento, borda e padding.
+if not hasattr(ft.alignment, "center"):
+    ft.alignment.center = ft.Alignment.CENTER
+    ft.alignment.top_left = ft.Alignment.TOP_LEFT
+    ft.alignment.bottom_right = ft.Alignment.BOTTOM_RIGHT
+if not hasattr(ft.border, "all"):
+    ft.border.all = ft.Border.all
+
 def resource_path(relative_path):
     """Ajusta o caminho de arquivos quando o app é empacotado em .exe"""
     try:
@@ -22,17 +30,22 @@ class Player:
         self.losses = 0
 
 class Match:
-    def __init__(self, player1=None, player2=None, previous1=None, previous2=None, use_losers=False, is_champion_slot=False, set_parent=True):
+    def __init__(self, player1=None, player2=None, previous1=None, previous2=None, use_losers=False, is_champion_slot=False, is_third_place_match=False, set_parent=True, use_losers1=None, use_losers2=None):
         self.player1 = player1
         self.player2 = player2
         self.previous1 = previous1
         self.previous2 = previous2
-        # only set the parent on the previous matches when requested.
-        # This avoids overwriting existing parent links (important for third-place match).
+        self.use_losers1 = use_losers if use_losers1 is None else use_losers1
+        self.use_losers2 = use_losers if use_losers2 is None else use_losers2
+        self._result_players = None
+        self._result_resolved = False
+        self._last_input_signature = None
+        # A match can feed both its winner and its loser into different matches.
+        # Keep the normal winner path as the parent; loser paths must not replace it.
         if set_parent:
-            if self.previous1:
+            if self.previous1 and not self.use_losers1:
                 self.previous1.parent = self
-            if self.previous2:
+            if self.previous2 and not self.use_losers2:
                 self.previous2.parent = self
         self.winner = None
         self.parent = None
@@ -45,14 +58,19 @@ class Match:
         # flags for special behavior
         self.use_losers = use_losers
         self.is_champion_slot = is_champion_slot
+        self.is_third_place_match = is_third_place_match
+        self._third_place_players = None
         if self.player1 is None and self.player2 is not None:
-            self.winner = self.player2
+            self.record_winner(self.player2)
         elif self.player2 is None and self.player1 is not None:
-            self.winner = self.player1
+            self.record_winner(self.player1)
 
     def get_player1(self):
-        # If this match is configured to use losers, fetch the loser from previous1
-        if self.use_losers:
+        if self.is_champion_slot:
+            if self.previous1:
+                return self.previous1.winner
+            return self.player1
+        if self.use_losers1:
             if self.previous1:
                 return self.previous1.get_loser()
             return None
@@ -63,7 +81,9 @@ class Match:
         return None
 
     def get_player2(self):
-        if self.use_losers:
+        if self.is_champion_slot:
+            return None
+        if self.use_losers2:
             if self.previous2:
                 return self.previous2.get_loser()
             return None
@@ -82,6 +102,96 @@ class Match:
         if p1 and p2:
             return p2 if self.winner == p1 else p1
         return None
+
+    def sides_resolved(self):
+        return (
+            (self.previous1 is None or self.previous1.is_resolved())
+            and (self.previous2 is None or self.previous2.is_resolved())
+        )
+
+    def is_resolved(self):
+        return self.winner is not None or self._result_resolved
+
+    def record_winner(self, player):
+        self.winner = player
+        self._result_players = (self.get_player1(), self.get_player2())
+        self._result_resolved = True
+
+    def mark_resolved_empty(self):
+        self.winner = None
+        self._result_players = None
+        self._result_resolved = True
+
+    def clear_result(self):
+        self.winner = None
+        self._result_players = None
+        self._result_resolved = False
+        self.p1_series = 0
+        self.p2_series = 0
+        self._had_winner = False
+
+
+def seed(n):
+    """Return seeded bracket positions, using 0 for empty bye slots."""
+    if n == 0:
+        return []
+    order = [1]
+    for _ in range(math.ceil(math.log2(n))):
+        last = 2 * len(order) + 1
+        order = [entry if entry <= n else 0 for pair in [[item, last - item] for item in order] for entry in pair]
+    return order
+
+
+def _create_opening_round(players, all_matches):
+    player_order = seed(len(players))
+    player_slots = [None if position == 0 else players[position - 1] for position in player_order]
+    opening_round = []
+    for index in range(0, len(player_slots), 2):
+        match = Match(
+            player_slots[index],
+            player_slots[index + 1] if index + 1 < len(player_slots) else None,
+        )
+        opening_round.append(match)
+        all_matches.append(match)
+    return opening_round
+
+
+def _create_round_from_sources(sources, all_matches, seed_slots=False):
+    """Create a seeded bracket round from prior match winners."""
+    if seed_slots:
+        source_order = seed(len(sources))
+        seeded_sources = [None if position == 0 else sources[position - 1] for position in source_order]
+    else:
+        seeded_sources = list(sources)
+        if len(seeded_sources) % 2:
+            seeded_sources.append(None)
+    new_round = []
+    for index in range(0, len(seeded_sources), 2):
+        match = Match(
+            previous1=seeded_sources[index],
+            previous2=seeded_sources[index + 1] if index + 1 < len(seeded_sources) else None,
+        )
+        new_round.append(match)
+        all_matches.append(match)
+    return new_round
+
+
+def build_tournament_brackets(players):
+    """Build the match graph for single elimination."""
+    all_matches = []
+    winner_rounds = [_create_opening_round(players, all_matches)]
+    while len(winner_rounds[-1]) > 1:
+        winner_rounds.append(_create_round_from_sources(winner_rounds[-1], all_matches))
+
+    champion_match = Match(previous1=winner_rounds[-1][0], is_champion_slot=True)
+    all_matches.append(champion_match)
+
+    return {
+        "winner_rounds": winner_rounds,
+        "champion_match": champion_match,
+        "all_matches": all_matches,
+    }
+
 
 def main(page: ft.Page):
     page.title = "Tornify"
@@ -109,7 +219,7 @@ def main(page: ft.Page):
     connector_width = 40
     base_spacing = 20
 
-    # Third-place rectangle reference so we can update theme live
+    # Third-place rectangle reference so we can update the theme immediately.
     third_place_rectangle = [None]  # container reference
 
     # Zoom related variables (affect only the tournament bracket container)
@@ -121,7 +231,6 @@ def main(page: ft.Page):
     # Keep rounds_list for re-rendering at different zoom levels
     rounds_list_global = {"value": None}
     third_place_match_global = {"value": None}
-    champion_match_global = {"value": None}
 
     # Create confetti canvas at the beginning
     confetti_canvas = cv.Canvas(shapes=[], expand=True)
@@ -332,7 +441,7 @@ def main(page: ft.Page):
         )
         container.content = edit_field
         apply_theme(None)
-        edit_field.focus()
+        page.run_task(edit_field.focus)
         page.update()
 
     def confirm_edit(e, index, container: ft.Container, detector: ft.GestureDetector):
@@ -397,19 +506,8 @@ def main(page: ft.Page):
                 if m.player2 is not None:
                     m.player2 = leaf_players[idx]
                     idx += 1
-                if m.player1 is None or m.player2 is None:
-                    m.winner = m.player1 or m.player2
-                else:
-                    m.winner = None
-                    m.p1_series = 0
-                    m.p2_series = 0
             for m in all_matches:
-                if m.previous1 or m.previous2:
-                    m.winner = None
-                    m.p1_series = 0
-                    m.p2_series = 0
-                if hasattr(m, '_had_winner'):
-                    m._had_winner = False
+                m.clear_result()
             update_all()
         page.update()
 
@@ -423,7 +521,6 @@ def main(page: ft.Page):
         third_place_rectangle[0] = None
         rounds_list_global["value"] = None
         third_place_match_global["value"] = None
-        champion_match_global["value"] = None
         
         bottom_part.content = ft.Column(
             [],
@@ -495,7 +592,7 @@ def main(page: ft.Page):
             bottom_part.content.controls.append(ft.Row([detector], alignment=ft.MainAxisAlignment.CENTER))
         nome_input.value = ""
         apply_theme(None)
-        nome_input.focus()
+        page.run_task(nome_input.focus)
         page.update()
 
     def update_all():
@@ -503,15 +600,6 @@ def main(page: ft.Page):
             if match.update_func:
                 match.update_func()
         page.update()
-
-    def seed(n):
-        if n == 0:
-            return []
-        ol = [1]
-        for i in range(math.ceil(math.log2(n))):
-            l = 2 * len(ol) + 1
-            ol = [e if e <= n else 0 for s in [[el, l - el] for el in ol] for e in s]
-        return ol
 
     def start_tournament(e):
         nonlocal tournament_running, bracket_row, tournament_bracket_container, base_bracket_width, base_bracket_height
@@ -526,51 +614,23 @@ def main(page: ft.Page):
             return
 
         include_third = third_place_checkbox.value
-
         tournament_running = True
         connector_canvases.clear()
         all_matches.clear()
         random.shuffle(players)
-        num_players = len(players)
-        
         bottom_part.content = ft.Container() # placeholder temporario
         third_place_rectangle[0] = None  # reset ref
-
-        depth = math.ceil(math.log2(num_players))
-        total_slots = 2 ** depth
-        
-        seed_order = seed(num_players)
-        player_objects = [None if s == 0 else players[s - 1] for s in seed_order]
-
-        leaf_matches = []
-        for i in range(0, total_slots, 2):
-            p1 = player_objects[i]
-            p2 = player_objects[i + 1] if i + 1 < len(player_objects) else None
-            m = Match(p1, p2)
-            leaf_matches.append(m)
-            all_matches.append(m)
-
-        rounds_list = [leaf_matches]
-        current = leaf_matches
-        while len(current) > 1:
-            new_level = []
-            for i in range(0, len(current), 2):
-                previous2 = current[i + 1] if i + 1 < len(current) else None
-                m = Match(previous1=current[i], previous2=previous2)
-                new_level.append(m)
-                all_matches.append(m)
-            rounds_list.append(new_level)
-            current = new_level
-
-        champion_match = Match(previous1=current[0], is_champion_slot=True)
-        all_matches.append(champion_match)
-        rounds_list.append([champion_match])
+        bracket_state = build_tournament_brackets(players)
+        all_matches.extend(bracket_state["all_matches"])
+        winner_rounds = bracket_state["winner_rounds"]
+        champion_match = bracket_state["champion_match"]
+        rounds_list = winner_rounds + [[champion_match]]
 
         third_place_match = None
-        if include_third and len(rounds_list) >= 3:
-            semifinal_matches = rounds_list[-3]
+        if include_third and len(winner_rounds) >= 2:
+            semifinal_matches = winner_rounds[-2]
             if len(semifinal_matches) >= 2:
-                third_place_match = Match(previous1=semifinal_matches[0], previous2=semifinal_matches[1], use_losers=True, is_champion_slot=False, set_parent=False)
+                third_place_match = Match(previous1=semifinal_matches[0], previous2=semifinal_matches[1], use_losers=True, is_champion_slot=False, is_third_place_match=True, set_parent=False)
                 all_matches.append(third_place_match)
 
         for i, m in enumerate(all_matches):
@@ -578,23 +638,17 @@ def main(page: ft.Page):
 
         rounds_list_global["value"] = rounds_list
         third_place_match_global["value"] = third_place_match
-        champion_match_global["value"] = champion_match
 
         round_col_width = 200
         fixed_box_width = 220
         num_rounds = len(rounds_list)
-        
+        base_match_height = 90
         total_width = num_rounds * round_col_width + max(0, num_rounds - 1) * connector_width
         if third_place_match:
             total_width += connector_width + fixed_box_width
-        total_width += 80
-        
-        base_bracket_width = total_width
-
-        base_match_height = 90
-        num_first_round_matches = len(rounds_list[0])
-        calculated_height = (num_first_round_matches * base_match_height) + (max(0, num_first_round_matches - 1) * base_spacing)
-        calculated_height += 100 
+        base_bracket_width = total_width + 80
+        num_opening_round_matches = len(rounds_list[0])
+        calculated_height = (num_opening_round_matches * base_match_height) + (max(0, num_opening_round_matches - 1) * base_spacing) + 100
         base_bracket_height = max(calculated_height, 600)
 
         bracket_row = ft.Row(
@@ -607,7 +661,7 @@ def main(page: ft.Page):
             content=ft.Container(),
             width=base_bracket_width,
             height=base_bracket_height,
-            padding=ft.padding.only(10),
+            padding=ft.Padding.only(left=10),
         )
 
         outer_scroll_column = ft.Column(
@@ -615,9 +669,8 @@ def main(page: ft.Page):
             scroll=ft.ScrollMode.AUTO,
             expand=True,
             alignment=ft.MainAxisAlignment.START,
-            horizontal_alignment=ft.CrossAxisAlignment.START
+            horizontal_alignment=ft.CrossAxisAlignment.START,
         )
-
         bottom_part.content = outer_scroll_column
 
         tournament_bracket_container.data = {
@@ -677,7 +730,13 @@ def main(page: ft.Page):
         for level, round_matches in enumerate(rounds_list):
             label = get_elim_round_label(len(round_matches), level, num_rounds)
 
-            header = ft.Text(label, size=int(18 * scale), weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER)
+            header = ft.Text(
+                label,
+                size=int(18 * scale),
+                weight=ft.FontWeight.BOLD,
+                text_align=ft.TextAlign.CENTER,
+                color=theme_vars.get("name_color", "#000000"),
+            )
             round_column = ft.Column(spacing=spacing, alignment=ft.MainAxisAlignment.START, expand=True)
             round_column.controls.append(header)
 
@@ -754,7 +813,13 @@ def main(page: ft.Page):
         if third_place_match:
             bracket_row.controls.append(ft.Container(width=connector_w))
 
-            header = ft.Text("3º Lugar", size=int(16 * scale), weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER)
+            header = ft.Text(
+                "3º Lugar",
+                size=int(16 * scale),
+                weight=ft.FontWeight.BOLD,
+                text_align=ft.TextAlign.CENTER,
+                color=theme_vars.get("name_color", "#000000"),
+            )
 
             box_bg = theme_vars.get('tbd_bg', ft.Colors.GREY_200)
             box_border = theme_vars.get('line_color', ft.Colors.BLACK)
@@ -819,7 +884,7 @@ def main(page: ft.Page):
 
         if has_p1_side:
             p1_text = ft.Text(p1.name if p1 else "", size=text_size, text_align=ft.TextAlign.CENTER)
-            p1_container = ft.Container(content=p1_text, width=cont_width, height=cont_height, padding=ft.padding.all(padding_value), border_radius=20, alignment=ft.alignment.center)
+            p1_container = ft.Container(content=p1_text, width=cont_width, height=cont_height, padding=ft.Padding.all(value=padding_value), border_radius=20, alignment=ft.alignment.center)
             p1_container.data = {'player': p1, 'match_id': match.id} if p1 else None
 
             def edit_p1(e):
@@ -852,13 +917,17 @@ def main(page: ft.Page):
                 )
                 p1_container.content = edit_field
                 page.update()
-                edit_field.focus()
+                page.run_task(edit_field.focus)
 
             def double_tap_p1(e):
                 if match.winner is None and p1 and p2:
                     match.p1_series += 1
                     if match.p1_series >= math.ceil(match.best_of / 2):
-                        match.winner = p1
+                        match.record_winner(p1)
+                    update_all()
+                elif match.is_third_place_match and match.winner == p1:
+                    # Um segundo duplo clique no vencedor desfaz o resultado do 3º lugar.
+                    match.clear_result()
                     update_all()
 
             p1_gesture = ft.GestureDetector(
@@ -887,7 +956,7 @@ def main(page: ft.Page):
 
         if has_p2_side:
             p2_text = ft.Text(p2.name if p2 else "", size=text_size, text_align=ft.TextAlign.CENTER)
-            p2_container = ft.Container(content=p2_text, width=cont_width, height=cont_height, padding=ft.padding.all(padding_value), border_radius=20, alignment=ft.alignment.center)
+            p2_container = ft.Container(content=p2_text, width=cont_width, height=cont_height, padding=ft.Padding.all(value=padding_value), border_radius=20, alignment=ft.alignment.center)
             p2_container.data = {'player': p2, 'match_id': match.id} if p2 else None
 
             def edit_p2(e):
@@ -920,13 +989,17 @@ def main(page: ft.Page):
                 )
                 p2_container.content = edit_field
                 page.update()
-                edit_field.focus()
+                page.run_task(edit_field.focus)
 
             def double_tap_p2(e):
                 if match.winner is None and p1 and p2:
                     match.p2_series += 1
                     if match.p2_series >= math.ceil(match.best_of / 2):
-                        match.winner = p2
+                        match.record_winner(p2)
+                    update_all()
+                elif match.is_third_place_match and match.winner == p2:
+                    # Um segundo duplo clique no vencedor desfaz o resultado do 3º lugar.
+                    match.clear_result()
                     update_all()
 
             p2_gesture = ft.GestureDetector(
@@ -969,6 +1042,44 @@ def main(page: ft.Page):
             nonlocal p1, p2
             p1 = match.get_player1()
             p2 = match.get_player2()
+            current_players = (p1, p2)
+            input_signature = (
+                current_players,
+                match.previous1.is_resolved() if match.previous1 else None,
+                match.previous2.is_resolved() if match.previous2 else None,
+            )
+
+            if (
+                match._last_input_signature is not None
+                and input_signature != match._last_input_signature
+                and not match.is_champion_slot
+            ):
+                match.clear_result()
+            match._last_input_signature = input_signature
+
+            if not match.is_champion_slot:
+                if match.winner is not None and (
+                    match.winner not in current_players
+                    or match._result_players != current_players
+                ):
+                    match.clear_result()
+
+                if match.winner is None and match.sides_resolved():
+                    if (p1 is None) != (p2 is None):
+                        match.record_winner(p1 or p2)
+                    elif p1 is None and p2 is None and (
+                        match.previous1 is not None or match.previous2 is not None
+                    ):
+                        match.mark_resolved_empty()
+
+            # A third-place result only remains valid while both semifinal
+            # losers are the same participants as when the slot was last updated.
+            if match.is_third_place_match:
+                if match._third_place_players is None:
+                    match._third_place_players = current_players
+                elif current_players != match._third_place_players:
+                    match.clear_result()
+                    match._third_place_players = current_players
 
             name_color = theme_vars.get('name_color', '#000000')
             name_bg = theme_vars.get('name_bg', '#FFFFFF')
@@ -1059,6 +1170,8 @@ def main(page: ft.Page):
         previous = match.previous1 if is_p1 else match.previous2
         if previous is None:
             return False
+        if (match.use_losers1 if is_p1 else match.use_losers2):
+            return False
         if source_data['match_id'] != previous.id:
             return False
         if source_data['player'] != previous.get_player1() and source_data['player'] != previous.get_player2():
@@ -1074,13 +1187,13 @@ def main(page: ft.Page):
             return
 
         if match.parent and source_data['match_id'] == match.parent.id:
-            match.winner = None
+            match.clear_result()
             update_all()
             return
 
         previous = match.previous1 if is_p1 else match.previous2
         if previous and previous.id == source_data['match_id']:
-            previous.winner = source_data['player']
+            previous.record_winner(source_data['player'])
             update_all()
 
     def combined_leave(e, match, is_p1):
@@ -1108,8 +1221,9 @@ def main(page: ft.Page):
         width=200,
     )
 
-    def apply_theme(e):
-        theme = theme_dropdown.value
+    def apply_theme(selected_theme=None):
+        theme = selected_theme or theme_dropdown.value
+        theme_dropdown.value = theme
         gradient = None
         dropdown_border = None
         name_bg = '#FFFFFF'
@@ -1379,10 +1493,10 @@ def main(page: ft.Page):
                 btn.color = button_color
         nome_input.bgcolor = input_bg
         nome_input.border_color = input_border
-        if dropdown_border:
-            theme_dropdown.border_color = dropdown_border
-        else:
-            theme_dropdown.border_color = None
+        nome_input.color = name_color
+        theme_dropdown.bgcolor = input_bg
+        theme_dropdown.color = name_color
+        theme_dropdown.border_color = dropdown_border or input_border
 
         if tournament_running:
             update_all()
@@ -1422,15 +1536,31 @@ def main(page: ft.Page):
             elif isinstance(ctrl, ft.Container):
                 ctrl.content.color = text_color
 
-        page.update()
         apply_transform()
+        main_container.update()
+        page.update()
 
-    theme_dropdown.on_change = apply_theme
+    def on_theme_change(e):
+        # Current Flet emits `on_select` and updates the control value before
+        # invoking the handler. Older Flet releases use `on_change`.
+        selected = getattr(getattr(e, "control", None), "value", None)
+        if not selected:
+            selected = getattr(e, "data", None) or theme_dropdown.value
+        apply_theme(selected)
+
+    if hasattr(theme_dropdown, "on_select"):
+        theme_dropdown.on_select = on_theme_change
+    else:
+        theme_dropdown.on_change = on_theme_change
 
     top_part = ft.Container(
         content=ft.Column(
             [
-                ft.Row([theme_dropdown, third_place_checkbox], alignment=ft.MainAxisAlignment.CENTER),
+                ft.Row(
+                    [theme_dropdown, third_place_checkbox],
+                    alignment=ft.MainAxisAlignment.CENTER,
+                    spacing=10,
+                ),
                 ft.Row([nome_input], alignment=ft.MainAxisAlignment.CENTER),
                 ft.Row(buttons, alignment=ft.MainAxisAlignment.CENTER, spacing=10),
             ],
